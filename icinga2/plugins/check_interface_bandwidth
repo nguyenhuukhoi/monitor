@@ -4,6 +4,7 @@ import os
 import time
 import sys
 import argparse
+import subprocess
 
 # Define default thresholds in bps
 default_warning_threshold = 1500000000  # 1.5 Gbps
@@ -22,6 +23,51 @@ def get_tx_rx_bytes(interface_name):
     except Exception as e:
         print(f"UNKNOWN: {str(e)}")
         sys.exit(3)  # Nagios plugin status: UNKNOWN
+
+def get_link_status(interface_name):
+    try:
+        # Use ethtool to check the link status
+        result = subprocess.run(["ethtool", interface_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode == 0 and "Link detected: yes" in result.stdout:
+            return True
+        else:
+            return False
+    except Exception as e:
+        print(f"UNKNOWN: {str(e)}")
+        sys.exit(3)  # Nagios plugin status: UNKNOWN
+
+def get_max_speed(interface_name):
+    try:
+        # Use 'ethtool' command to get the maximum speed of the interface
+        result = subprocess.run(["ethtool", interface_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode == 0:
+            lines = result.stdout.splitlines()
+            for line in lines:
+                if "Speed:" in line:
+                    parts = line.split()
+                    speed_value = parts[1].strip()
+                    numeric_speed = int(''.join(filter(str.isdigit, speed_value)))
+                    return numeric_speed
+        return None
+    except Exception as e:
+        print(f"UNKNOWN: {str(e)}")
+        sys.exit(3)  # Nagios plugin status: UNKNOWN
+
+def get_interface_ip(interface_name):
+    try:
+        # Use the 'ip' command to get the IP address of the interface
+        result = subprocess.run(["ip", "addr", "show", interface_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode == 0:
+            # Parse the output to find the IP address
+            lines = result.stdout.splitlines()
+            for line in lines:
+                if "inet " in line:
+                    parts = line.split()
+                    ip = parts[1].split("/")[0]
+                    return ip
+        return None
+    except Exception as e:
+        return None
 
 def parse_human_readable(value):
     """
@@ -50,61 +96,114 @@ def format_human_readable(bps_value):
     else:
         return f"{bps_value:.2f} bps"
 
-def check_bandwidth(tx_rate_bps, rx_rate_bps, warning_threshold, critical_threshold, direction=None):
-    if direction is None:
-        print(f"OK - TX rate: {format_human_readable(tx_rate_bps)}, RX rate: {format_human_readable(rx_rate_bps)} | TX={tx_rate_bps}bps RX={rx_rate_bps}bps")
-        sys.exit(0)  # Nagios plugin status: OK
+def calculate_percentage(bandwidth_bps, max_speed_bps):
+    """
+    Calculate the percentage of bandwidth relative to the maximum speed.
+    """
+    return (bandwidth_bps / max_speed_bps) * 100
 
-    if direction == "tx":
-        bandwidth_bps = tx_rate_bps
-    elif direction == "rx":
-        bandwidth_bps = rx_rate_bps
-    else:
-        print("UNKNOWN - Invalid direction specified.")
-        sys.exit(3)  # Nagios plugin status: UNKNOWN
-
-    if bandwidth_bps >= critical_threshold:
-        print(f"CRITICAL - {direction.upper()} rate: {format_human_readable(bandwidth_bps)} | {direction.upper()}={bandwidth_bps}bps")
-        sys.exit(2)  # Nagios plugin status: CRITICAL
-    elif bandwidth_bps >= warning_threshold:
-        print(f"WARNING - {direction.upper()} rate: {format_human_readable(bandwidth_bps)} | {direction.upper()}={bandwidth_bps}bps")
-        sys.exit(1)  # Nagios plugin status: WARNING
-    else:
-        print(f"OK - {direction.upper()} rate: {format_human_readable(bandwidth_bps)} | {direction.upper()}={bandwidth_bps}bps")
-        sys.exit(0)  # Nagios plugin status: OK
+def check_and_exit(status, output):
+    print(f"{status} - {output}")
+    sys.exit(2 if status == 'CRITICAL' else 1 if status == 'WARNING' else 0)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Check network interface bandwidth")
+    parser = argparse.ArgumentParser(description="Check network interface bandwidth and link status")
     parser.add_argument("-i", "--interface", required=True, help="Network interface name to monitor (e.g., ens3)")
     parser.add_argument("-d", "--direction", choices=["tx", "rx"], help="Direction to check (tx or rx)")
     parser.add_argument("-w", "--warning", type=parse_human_readable, default=default_warning_threshold,
                         help="Warning threshold in human-readable format (e.g., '1.5 Gbps')")
     parser.add_argument("-c", "--critical", type=parse_human_readable, default=default_critical_threshold,
                         help="Critical threshold in human-readable format (e.g., '9 Gbps')")
+    parser.add_argument("-p", "--percentage", action="store_true", help="Display bandwidth as a percentage of the maximum speed")
 
     args = parser.parse_args()
 
+    interface_name = args.interface
+    direction = args.direction
+    warning_threshold = args.warning
+    critical_threshold = args.critical
+    show_percentage = args.percentage
+
+    link_status = get_link_status(interface_name)
+
+    if not link_status:
+        check_and_exit('CRITICAL', 'Link is DOWN')
+
+    max_speed = get_max_speed(interface_name)
+
     try:
         # Initial measurement
-        tx_start, rx_start = get_tx_rx_bytes(args.interface)
+        tx_start, rx_start = get_tx_rx_bytes(interface_name)
         time.sleep(5)  # Wait for the specified interval (5 seconds)
         # Second measurement after waiting
-        tx_end, rx_end = get_tx_rx_bytes(args.interface)
+        tx_end, rx_end = get_tx_rx_bytes(interface_name)
 
         if tx_start is not None and rx_start is not None and tx_end is not None and rx_end is not None:
             # Calculate TX and RX rates per second in bits per second (bps)
             tx_rate_bps = ((tx_end - tx_start) * 8) / 5  # Measurement interval is 5 seconds
             rx_rate_bps = ((rx_end - rx_start) * 8) / 5  # Measurement interval is 5 seconds
 
-            # Check bandwidth based on the specified direction (if provided)
-            check_bandwidth(tx_rate_bps, rx_rate_bps, args.warning, args.critical, args.direction)
+            if direction is None:
+                tx_status = 'OK'
+                rx_status = 'OK'
+
+                tx_output = [f"TX rate: {format_human_readable(tx_rate_bps)}"]
+                rx_output = [f"RX rate: {format_human_readable(rx_rate_bps)}"]
+
+                if tx_rate_bps >= critical_threshold:
+                    tx_status = 'CRITICAL'
+                elif tx_rate_bps >= warning_threshold:
+                    tx_status = 'WARNING'
+
+                if rx_rate_bps >= critical_threshold:
+                    rx_status = 'CRITICAL'
+                elif rx_rate_bps >= warning_threshold:
+                    rx_status = 'WARNING'
+
+                status_code = 2 if 'CRITICAL' in (tx_status, rx_status) else 1 if 'WARNING' in (tx_status, rx_status) else 0
+
+                output = ', '.join(tx_output + rx_output)
+                ip_address = get_interface_ip(interface_name)
+                ip_address_str = f"IP: {ip_address}, " if ip_address else ""
+                max_speed_str = f"Maxspeed: {max_speed}mbps" if max_speed else ""
+                output = f"{output} {ip_address_str}{max_speed_str} | TX={tx_rate_bps}bps RX={rx_rate_bps}bps"
+                if show_percentage and max_speed:
+                    tx_percentage = calculate_percentage(tx_rate_bps, int(max_speed) * 1000000)
+                    rx_percentage = calculate_percentage(rx_rate_bps, int(max_speed) * 1000000)
+                    output += f" TX%={tx_percentage:.2f}% RX%={rx_percentage:.2f}%"
+                check_and_exit(max(tx_status, rx_status), output)
+
+            else:
+                if direction == "tx":
+                    bandwidth_bps = tx_rate_bps
+                elif direction == "rx":
+                    bandwidth_bps = rx_rate_bps
+                else:
+                    check_and_exit('UNKNOWN', 'Invalid direction specified.')
+
+                status = 'OK'
+                output = f"{direction.upper()} rate: {format_human_readable(bandwidth_bps)}"
+
+                if bandwidth_bps >= critical_threshold:
+                    status = 'CRITICAL'
+                elif bandwidth_bps >= warning_threshold:
+                    status = 'WARNING'
+
+                ip_address = get_interface_ip(interface_name)
+                ip_address_str = f"IP: {ip_address}, " if ip_address else ""
+                max_speed_str = f"Maxspeed: {max_speed}mbps" if max_speed else ""
+                output = f"{output} {ip_address_str}{max_speed_str} | TX={tx_rate_bps}bps RX={rx_rate_bps}bps"
+
+                if show_percentage and max_speed:
+                    tx_percentage = calculate_percentage(tx_rate_bps, int(max_speed) * 1000000)
+                    rx_percentage = calculate_percentage(rx_rate_bps, int(max_speed) * 1000000)
+                    output += f" TX%={tx_percentage:.2f}% RX%={rx_percentage:.2f}%"
+                check_and_exit(status, output)
 
         else:
-            print(f"UNKNOWN - Failed to retrieve TX and RX byte counts for interface {args.interface}")
-            sys.exit(3)  # Nagios plugin status: UNKNOWN
+            check_and_exit('UNKNOWN', f"Failed to retrieve TX and RX byte counts for interface {interface_name}")
 
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        print(f"CRITICAL - {str(e)}")
-        sys.exit(2)  # Nagios plugin status: CRITICAL
+        check_and_exit('CRITICAL', str(e))
